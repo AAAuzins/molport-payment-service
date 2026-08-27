@@ -18,23 +18,31 @@ public class OracleRepository
     public async Task<IEnumerable<OpenInvoice>> GetOpenAdvancedPaymentInvoicesAsync()
     {
         const string sql = """
-            SELECT
-                i.ID                    AS InvoiceId,
-                i.ORDER_ID              AS OrderId,
-                i.invoice_number        AS InvoiceNumber,
-                o.Molport_Order_Number  AS OrderNumber,
-                i.PRICE                 AS Amount,
-                c.CODE                  AS CurrencyCode,
-                i.CURRENCY_ID           AS CurrencyId
-            FROM ORDER_TRACKING.OT_INVOICE i
-            JOIN ORDER_TRACKING.OT_ORDER o ON o.ID = i.ORDER_ID
-            JOIN MOLPORT.ADM_CODIF_ENTRY c ON c.ID = i.CURRENCY_ID
-            WHERE (i.BALANCE_DUE > 0 OR i.PAID_AMOUNT IS NULL)
-              AND i.PRICE > 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM ORDER_TRACKING.OT_PAYMENT p
-                  WHERE p.INVOICE_ID = i.ID
-              )
+            SELECT * FROM (
+                SELECT
+                    i.ID                    AS InvoiceId,
+                    i.ORDER_ID              AS OrderId,
+                    i.invoice_number        AS InvoiceNumber,
+                    o.Molport_Order_Number  AS OrderNumber,
+                    NVL(i.BALANCE_DUE,
+                        (NVL(i.PRICE, 0) - NVL(i.PRICE_DISCOUNT, 0)
+                         + NVL(i.QC_PRICE, 0) + NVL(i.REFORMATTING_PRICE, 0) + NVL(i.REWEIGHING_PRICE, 0)
+                           + NVL(i.DRY_ICE_PRICE, 0) + NVL(i.HANDLING_COST_PRICE, 0)
+                         + NVL(i.VAT21_PRICE, 0) + NVL(i.REIMBURSEMENT_PRICE, 0) + NVL(i.SALES_TAX_PRICE, 0)
+                         + NVL(i.SHIPPING_PRICE, 0) + NVL(i.TARIFF_AMOUNT, 0))
+                        - NVL(i.PAID_AMOUNT, 0)) AS Amount,
+                    c.CODE                  AS CurrencyCode,
+                    i.CURRENCY_ID           AS CurrencyId
+                FROM ORDER_TRACKING.OT_INVOICE i
+                JOIN ORDER_TRACKING.OT_ORDER o ON o.ID = i.ORDER_ID
+                JOIN MOLPORT.ADM_CODIF_ENTRY c ON c.ID = i.CURRENCY_ID
+                WHERE i.PRICE > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ORDER_TRACKING.OT_PAYMENT p
+                      WHERE p.INVOICE_ID = i.ID
+                  )
+            )
+            WHERE Amount > 0
             """;
 
         using var conn = OpenConnection();
