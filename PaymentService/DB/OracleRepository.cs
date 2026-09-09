@@ -129,10 +129,6 @@ public class OracleRepository
         return rows.ToDictionary(r => r.Code.ToUpperInvariant(), r => r.Id);
     }
 
-    // Upsert keyed by TRANSACTION_ID: a transaction that keeps failing the same (or a different)
-    // check gets its existing row refreshed in place — preserving the original CREATED date, so a
-    // repeatedly-retried-and-still-failing item ages out of PaymentReviewRetryWorker's retry window
-    // instead of having its clock reset every retry.
     public async Task UpsertReviewItemAsync(string source, string transactionId, DateTime transactionDate,
         decimal transactionAmount, long transactionCurrencyId, long? invoiceId, long? orderId,
         decimal? expectedAmount, long? expectedCurrencyId, string matchType, string rawDescription)

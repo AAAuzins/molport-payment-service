@@ -8,15 +8,6 @@ using PaymentService.Services;
 
 namespace PaymentService.Workers;
 
-// Daily sweep over ORDER_TRACKING.OT_PAYMENT_REVIEW: re-attempts anything that previously failed
-// to match (NoMatch/AmountMismatch/CurrencyMismatch) or matched but couldn't reach Horizon
-// (HorizonPendingBillingOrg), in case the underlying data (missing invoice, wrong amount/reference,
-// missing billing org) has since been fixed. Transaction details are re-fetched from Stripe by charge
-// id rather than persisted locally, so amount/currency/fee/reference are always accurate and no schema
-// change to the review table is needed. Only Stripe-sourced rows are retried today.
-// Rows older than PaymentReviewRetryMaxAgeDays are no longer picked up, so a genuinely-never-fixed
-// item stops being retried instead of continuing forever — it stays visible in BO's review view for
-// manual handling.
 public class PaymentReviewRetryWorker : BackgroundService
 {
     private readonly OracleRepository _repo;
@@ -107,9 +98,6 @@ public class PaymentReviewRetryWorker : BackgroundService
             await RetryHorizonPendingAsync(item, tx);
         else
         {
-            // Re-run through the normal matching pipeline in case the invoice was created/fixed since.
-            // PaymentMatchingService itself deletes this row on a full match, or upserts it in place
-            // (preserving the original CREATED date) if it still fails.
             await _matcher.ProcessTransactionsAsync([tx]);
         }
     }
