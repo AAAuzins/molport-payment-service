@@ -75,13 +75,15 @@ public class OracleRepositoryTests
     }
 
     [Fact]
-    public async Task ReviewItemInsertSucceeds()
+    public async Task ReviewItemUpsertSucceeds()
     {
-        // Verifies OT_PAYMENT_REVIEW exists and zoho has INSERT privilege.
+        // Verifies OT_PAYMENT_REVIEW exists and zoho has MERGE (insert+update) privilege.
         // Leaves one row with SOURCE='TEST' — safe to delete manually.
-        await _repo.InsertReviewItemAsync(
+        var transactionId = "TEST_REVIEW_PERMS_" + DateTime.UtcNow.Ticks;
+
+        await _repo.UpsertReviewItemAsync(
             source: "TEST",
-            transactionId: "TEST_REVIEW_PERMS_" + DateTime.UtcNow.Ticks,
+            transactionId: transactionId,
             transactionDate: DateTime.UtcNow,
             transactionAmount: 1.00m,
             transactionCurrencyId: 2,
@@ -91,5 +93,32 @@ public class OracleRepositoryTests
             expectedCurrencyId: null,
             matchType: "NoMatch",
             rawDescription: "automated permission check — safe to delete");
+
+        // Re-running with the same transactionId should update the existing row, not insert a duplicate.
+        await _repo.UpsertReviewItemAsync(
+            source: "TEST",
+            transactionId: transactionId,
+            transactionDate: DateTime.UtcNow,
+            transactionAmount: 2.00m,
+            transactionCurrencyId: 2,
+            invoiceId: null,
+            orderId: null,
+            expectedAmount: null,
+            expectedCurrencyId: null,
+            matchType: "AmountMismatch",
+            rawDescription: "automated permission check — safe to delete");
+    }
+
+    [Fact]
+    public async Task DeleteReviewItemsForTransactionSucceeds()
+    {
+        var transactionId = "TEST_REVIEW_DELETE_" + DateTime.UtcNow.Ticks;
+        await _repo.UpsertReviewItemAsync(
+            source: "TEST", transactionId: transactionId, transactionDate: DateTime.UtcNow,
+            transactionAmount: 1.00m, transactionCurrencyId: 2, invoiceId: null, orderId: null,
+            expectedAmount: null, expectedCurrencyId: null, matchType: "NoMatch",
+            rawDescription: "automated permission check — safe to delete");
+
+        await _repo.DeleteReviewItemsForTransactionAsync(transactionId);
     }
 }

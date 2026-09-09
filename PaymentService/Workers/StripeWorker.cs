@@ -23,9 +23,7 @@ public class StripeWorker : BackgroundService
         _repo = repo;
         _logger = logger;
         _pollInterval = TimeSpan.FromMinutes(settings.Value.StripePollIntervalMinutes);
-        _clients = settings.Value.StripeAccounts.ToDictionary(
-            a => a.Name,
-            a => new StripeApiClient(a.Name, a.ApiKey, clientLogger));
+        _clients = StripeApiClient.CreateClients(settings.Value, clientLogger);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

@@ -137,6 +137,10 @@ public class PaymentMatchingService
                     inv.InvoiceId, inv.OrderId, tx.Amount, inv.CurrencyId,
                     tx.TransactionDate, tx.TransactionId, tx.Source == PaymentSource.Stripe);
                 await _repo.UpdateInvoiceBalanceAsync(inv.InvoiceId);
+                // A payment now exists for this transaction, so any stale review row from an earlier
+                // failed attempt (NoMatch/AmountMismatch/etc.) no longer applies — clear it before
+                // possibly recording a new (different) reason below.
+                await _repo.DeleteReviewItemsForTransactionAsync(tx.TransactionId);
                 _logger.LogInformation(
                     "[{Source}] Matched transaction {TxId} → Invoice {InvoiceNr} ({Amount} {Currency})",
                     tx.Source, tx.TransactionId, inv.InvoiceNumber, tx.Amount, tx.Currency);
@@ -144,7 +148,16 @@ public class PaymentMatchingService
                 {
                     try
                     {
-                        await _horizon.ImportAsync(tx, inv);
+                        var horizonOutcome = await _horizon.ImportAsync(tx, inv);
+                        if (horizonOutcome == HorizonImportOutcome.MissingBillingOrg)
+                        {
+                            await _repo.UpsertReviewItemAsync(
+                                StripeSourceLabel(tx), tx.TransactionId, tx.TransactionDate,
+                                tx.Amount, inv.CurrencyId,
+                                inv.InvoiceId, inv.OrderId,
+                                inv.Amount, inv.CurrencyId,
+                                "HorizonPendingBillingOrg", tx.Description);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -170,8 +183,8 @@ public class PaymentMatchingService
                         tx.Source, tx.Currency, tx.TransactionId);
                     break;
                 }
-                await _repo.InsertReviewItemAsync(
-                    tx.Source.ToString(), tx.TransactionId, tx.TransactionDate,
+                await _repo.UpsertReviewItemAsync(
+                    StripeSourceLabel(tx), tx.TransactionId, tx.TransactionDate,
                     tx.Amount, txCurrencyId,
                     result.Invoice?.InvoiceId, result.Invoice?.OrderId,
                     result.Invoice?.Amount, result.Invoice?.CurrencyId,
@@ -187,4 +200,9 @@ public class PaymentMatchingService
                 break;
         }
     }
+
+    // Encodes the Stripe account (SIA/INC) into the review row's SOURCE column so PaymentReviewRetryWorker
+    // knows which API key to use when re-fetching the charge later.
+    private static string StripeSourceLabel(NormalizedTransaction tx) =>
+        tx.Source == PaymentSource.Stripe ? $"STRIPE_{tx.AccountName}" : tx.Source.ToString();
 }

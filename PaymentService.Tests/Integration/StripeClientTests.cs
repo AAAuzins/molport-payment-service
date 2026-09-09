@@ -72,6 +72,34 @@ public class StripeClientTests
     }
 
     [Fact]
+    public async Task GetChargeByIdAsync_ReturnsTransaction_ForKnownCharge()
+    {
+        const string chargeId = "ch_3TeED95AsVXSV8UQ0ZCcvjIq";
+        var incAccount = _settings.StripeAccounts.First(a => a.Name == "INC");
+        var client = new StripeApiClient(incAccount.Name, incAccount.ApiKey, NullLogger<StripeApiClient>.Instance);
+
+        var tx = await client.GetChargeByIdAsync(chargeId);
+
+        Assert.NotNull(tx);
+        Assert.Equal(chargeId, tx!.TransactionId);
+        Assert.Equal("INC", tx.AccountName);
+        Assert.Equal(PaymentSource.Stripe, tx.Source);
+        Assert.True(tx.Amount > 0);
+    }
+
+    [Fact]
+    public async Task GetChargeByIdAsync_ReturnsNull_ForWrongAccount()
+    {
+        const string chargeId = "ch_3TeED95AsVXSV8UQ0ZCcvjIq"; // belongs to INC, not SIA
+        var siaAccount = _settings.StripeAccounts.First(a => a.Name == "SIA");
+        var client = new StripeApiClient(siaAccount.Name, siaAccount.ApiKey, NullLogger<StripeApiClient>.Instance);
+
+        var tx = await client.GetChargeByIdAsync(chargeId);
+
+        Assert.Null(tx);
+    }
+
+    [Fact]
     public async Task ChargesHaveExpectedFields_AllAccounts()
     {
         foreach (var account in _settings.StripeAccounts)

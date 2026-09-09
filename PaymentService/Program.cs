@@ -19,6 +19,7 @@ builder.Services.AddSingleton<HorizonService>();
 builder.Services.AddSingleton<PaymentMatchingService>();
 builder.Services.AddHostedService<StripeWorker>();
 builder.Services.AddHostedService<SwedBankWorker>();
+builder.Services.AddHostedService<PaymentReviewRetryWorker>();
 
 var host = builder.Build();
 host.Run();

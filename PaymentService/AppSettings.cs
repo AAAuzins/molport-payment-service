@@ -8,6 +8,8 @@ public class AppSettings
     public SwedBankSettings SwedBank { get; set; } = new();
     public int SwedBankPollIntervalHours { get; set; } = 6;
     public HorizonSettings Horizon { get; set; } = new();
+    public int PaymentReviewRetryIntervalHours { get; set; } = 24;
+    public int PaymentReviewRetryMaxAgeDays { get; set; } = 7;
 }
 
 public class SwedBankSettings

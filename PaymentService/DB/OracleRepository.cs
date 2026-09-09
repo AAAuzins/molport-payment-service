@@ -129,21 +129,39 @@ public class OracleRepository
         return rows.ToDictionary(r => r.Code.ToUpperInvariant(), r => r.Id);
     }
 
-    public async Task InsertReviewItemAsync(string source, string transactionId, DateTime transactionDate,
+    // Upsert keyed by TRANSACTION_ID: a transaction that keeps failing the same (or a different)
+    // check gets its existing row refreshed in place — preserving the original CREATED date, so a
+    // repeatedly-retried-and-still-failing item ages out of PaymentReviewRetryWorker's retry window
+    // instead of having its clock reset every retry.
+    public async Task UpsertReviewItemAsync(string source, string transactionId, DateTime transactionDate,
         decimal transactionAmount, long transactionCurrencyId, long? invoiceId, long? orderId,
         decimal? expectedAmount, long? expectedCurrencyId, string matchType, string rawDescription)
     {
         const string sql = """
-            INSERT INTO ORDER_TRACKING.OT_PAYMENT_REVIEW
-                (SOURCE, TRANSACTION_ID, TRANSACTION_DATE, TRANSACTION_AMOUNT,
-                 TRANSACTION_CURRENCY_ID, INVOICE_ID, ORDER_ID,
-                 EXPECTED_AMOUNT, EXPECTED_CURRENCY_ID, MATCH_TYPE,
-                 RAW_DESCRIPTION, CREATED)
-            VALUES
-                (:source, :transactionId, :transactionDate, :transactionAmount,
-                 :transactionCurrencyId, :invoiceId, :orderId,
-                 :expectedAmount, :expectedCurrencyId, :matchType,
-                 :rawDescription, SYSDATE)
+            MERGE INTO ORDER_TRACKING.OT_PAYMENT_REVIEW t
+            USING (SELECT :transactionId AS TRANSACTION_ID FROM DUAL) s
+            ON (t.TRANSACTION_ID = s.TRANSACTION_ID)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    SOURCE = :source,
+                    TRANSACTION_DATE = :transactionDate,
+                    TRANSACTION_AMOUNT = :transactionAmount,
+                    TRANSACTION_CURRENCY_ID = :transactionCurrencyId,
+                    INVOICE_ID = :invoiceId,
+                    ORDER_ID = :orderId,
+                    EXPECTED_AMOUNT = :expectedAmount,
+                    EXPECTED_CURRENCY_ID = :expectedCurrencyId,
+                    MATCH_TYPE = :matchType,
+                    RAW_DESCRIPTION = :rawDescription
+            WHEN NOT MATCHED THEN
+                INSERT (SOURCE, TRANSACTION_ID, TRANSACTION_DATE, TRANSACTION_AMOUNT,
+                        TRANSACTION_CURRENCY_ID, INVOICE_ID, ORDER_ID,
+                        EXPECTED_AMOUNT, EXPECTED_CURRENCY_ID, MATCH_TYPE,
+                        RAW_DESCRIPTION, CREATED)
+                VALUES (:source, :transactionId, :transactionDate, :transactionAmount,
+                        :transactionCurrencyId, :invoiceId, :orderId,
+                        :expectedAmount, :expectedCurrencyId, :matchType,
+                        :rawDescription, SYSDATE)
             """;
 
         using var conn = OpenConnection();
@@ -161,6 +179,45 @@ public class OracleRepository
             matchType,
             rawDescription
         });
+    }
+
+    public async Task<IEnumerable<PendingReviewItem>> GetPendingReviewItemsAsync(int maxAgeDays)
+    {
+        const string sql = """
+            SELECT
+                SOURCE      AS Source,
+                TRANSACTION_ID AS TransactionId,
+                MATCH_TYPE  AS MatchType,
+                INVOICE_ID  AS InvoiceId,
+                ORDER_ID    AS OrderId
+            FROM ORDER_TRACKING.OT_PAYMENT_REVIEW
+            WHERE CREATED >= SYSDATE - :maxAgeDays
+            """;
+
+        using var conn = OpenConnection();
+        return await conn.QueryAsync<PendingReviewItem>(sql, new { maxAgeDays });
+    }
+
+    public async Task DeleteReviewItemsForTransactionAsync(string transactionId)
+    {
+        const string sql = """
+            DELETE FROM ORDER_TRACKING.OT_PAYMENT_REVIEW
+            WHERE TRANSACTION_ID = :transactionId
+            """;
+
+        using var conn = OpenConnection();
+        await conn.ExecuteAsync(sql, new { transactionId });
+    }
+
+    public async Task<string?> GetInvoiceNumberAsync(long invoiceId)
+    {
+        const string sql = """
+            SELECT INVOICE_NUMBER FROM ORDER_TRACKING.OT_INVOICE
+            WHERE ID = :invoiceId
+            """;
+
+        using var conn = OpenConnection();
+        return await conn.ExecuteScalarAsync<string?>(sql, new { invoiceId });
     }
 
     public async Task<InvoiceBillingOrg?> GetInvoiceBillingOrgAsync(long invoiceId)

@@ -50,13 +50,13 @@ public class HorizonService
         }.ToDictionary(c => c.AccountName);
     }
 
-    public async Task ImportAsync(NormalizedTransaction tx, OpenInvoice invoice)
+    public async Task<HorizonImportOutcome> ImportAsync(NormalizedTransaction tx, OpenInvoice invoice)
     {
         var accountName = tx.AccountName ?? "SIA";
         if (!_clients.TryGetValue(accountName, out var client))
         {
             _logger.LogError("Horizon: no client configured for account '{Account}'", accountName);
-            return;
+            return HorizonImportOutcome.NoClientConfigured;
         }
 
         var billingOrg = await _repo.GetInvoiceBillingOrgAsync(invoice.InvoiceId);
@@ -65,7 +65,7 @@ public class HorizonService
             _logger.LogWarning(
                 "Horizon [{Account}]: invoice {InvoiceId} has no billing org or billing code — skipping",
                 accountName, invoice.InvoiceId);
-            return;
+            return HorizonImportOutcome.MissingBillingOrg;
         }
 
         if (await client.ExistsByDocumentNumberAsync(tx.TransactionId))
@@ -73,12 +73,12 @@ public class HorizonService
             _logger.LogInformation(
                 "Horizon [{Account}]: payment order for {TxId} already exists — skipping",
                 accountName, tx.TransactionId);
-            return;
+            return HorizonImportOutcome.AlreadyExists;
         }
 
         var customerRestId = await GetOrCreateCustomerAsync(client, billingOrg);
         if (customerRestId == null)
-            return;
+            return HorizonImportOutcome.CustomerCreationFailed;
 
         var receiverId = GetReceiverId(accountName, invoice.CurrencyId);
         var paymentOrderXml = await BuildPaymentOrderXmlAsync(client, tx, invoice, customerRestId, receiverId);
@@ -100,6 +100,8 @@ public class HorizonService
                     accountName, tx.TransactionId);
             }
         }
+
+        return HorizonImportOutcome.Imported;
     }
 
     private async Task<string?> GetOrCreateCustomerAsync(HorizonClient client, InvoiceBillingOrg billingOrg)
