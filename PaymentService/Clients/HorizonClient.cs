@@ -78,20 +78,27 @@ public sealed class HorizonClient : IDisposable
         return req;
     }
 
+    // Sends the request built by buildRequest, and — since a request message can only be sent once —
+    // rebuilds and retries exactly once if the session had expired (401), re-authenticating first.
+    private async Task<HttpResponseMessage> SendWithReauthAsync(Func<HttpRequestMessage> buildRequest)
+    {
+        await EnsureAuthenticatedAsync();
+        using var req1 = buildRequest();
+        var resp = await _http.SendAsync(req1);
+        if (resp.StatusCode != HttpStatusCode.Unauthorized)
+            return resp;
+
+        resp.Dispose();
+        _authenticated = false;
+        await EnsureAuthenticatedAsync();
+        using var req2 = buildRequest();
+        return await _http.SendAsync(req2);
+    }
+
     private async Task<string> GetAsync(string path)
     {
         var url = _baseUrl + path;
-        await EnsureAuthenticatedAsync();
-        using var req1 = BuildGetRequest(url);
-        var resp = await _http.SendAsync(req1);
-        if (resp.StatusCode == HttpStatusCode.Unauthorized)
-        {
-            resp.Dispose();
-            _authenticated = false;
-            await EnsureAuthenticatedAsync();
-            using var req2 = BuildGetRequest(url);
-            resp = await _http.SendAsync(req2);
-        }
+        var resp = await SendWithReauthAsync(() => BuildGetRequest(url));
         await EnsureSuccessAsync(resp);
         return await resp.Content.ReadAsStringAsync();
     }
@@ -99,14 +106,10 @@ public sealed class HorizonClient : IDisposable
     private async Task<string> PostAsync(string path, string xml)
     {
         var url = _baseUrl + path;
-        await EnsureAuthenticatedAsync();
-        var resp = await _http.PostAsync(url, new StringContent(xml, Encoding.UTF8, "application/xml"));
-        if (resp.StatusCode == HttpStatusCode.Unauthorized)
+        var resp = await SendWithReauthAsync(() => new HttpRequestMessage(HttpMethod.Post, url)
         {
-            _authenticated = false;
-            await EnsureAuthenticatedAsync();
-            resp = await _http.PostAsync(url, new StringContent(xml, Encoding.UTF8, "application/xml"));
-        }
+            Content = new StringContent(xml, Encoding.UTF8, "application/xml")
+        });
         await EnsureSuccessAsync(resp);
         return await resp.Content.ReadAsStringAsync();
     }
@@ -123,28 +126,34 @@ public sealed class HorizonClient : IDisposable
     public async Task<string?> GetCustomerRestIdByCodeAsync(string billingCode)
     {
         var xml = await GetAsync($"/rest/TDdmKlSar/query?filter=K.KODS eq {billingCode}");
-        return XDocument.Parse(xml)
-            .Descendants().FirstOrDefault(e => e.Name.LocalName == "PK_KLIENTS")
-            ?.Descendants().FirstOrDefault(e => e.Name.LocalName == "href")?.Value;
+        return ExtractHref(xml, "PK_KLIENTS");
     }
 
     public async Task<string?> GetCountryRestIdByCodeAsync(string countryCode)
     {
         var xml = await GetAsync($"/rest/TdmSLDValsts/query?filter=DV.KODS eq {countryCode}");
-        return XDocument.Parse(xml)
-            .Descendants().FirstOrDefault(e => e.Name.LocalName == "PK_VALSTS")
-            ?.Descendants().FirstOrDefault(e => e.Name.LocalName == "href")?.Value;
+        return ExtractHref(xml, "PK_VALSTS");
     }
 
     public async Task<string> SaveAsync(string templateUrl, string xml)
     {
         var result = await PostAsync(templateUrl, xml);
-        var href = XDocument.Parse(result)
-            .Descendants().FirstOrDefault(e => e.Name.LocalName == "href")?.Value;
+        var href = ExtractHref(result);
         if (string.IsNullOrEmpty(href) || !href.StartsWith("/rest/"))
             throw new InvalidOperationException(
                 $"Horizon [{AccountName}] save to {templateUrl} returned unexpected response: {result[..Math.Min(500, result.Length)]}");
         return href;
+    }
+
+    // Finds the given element by local name (or searches the whole document when omitted) and
+    // returns its nested <href> value — the shape every Horizon query/save response comes back in.
+    private static string? ExtractHref(string xml, string? wrapperLocalName = null)
+    {
+        var doc = XDocument.Parse(xml);
+        XContainer? scope = wrapperLocalName == null
+            ? doc
+            : doc.Descendants().FirstOrDefault(e => e.Name.LocalName == wrapperLocalName);
+        return scope?.Descendants().FirstOrDefault(e => e.Name.LocalName == "href")?.Value;
     }
 
     public void Dispose()

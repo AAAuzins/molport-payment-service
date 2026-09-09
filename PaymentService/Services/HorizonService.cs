@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
@@ -25,8 +26,8 @@ public class HorizonService
     private const string MemorialOrderTemplateSia = "/rest/TDdmMO/template/235";
     private const string MemorialOrderTemplateInc = "/rest/TDdmMO/template/15";
     private const string MemorialClientId = "/rest/TDdmCustomer/1";
-    private const string CurrencyHref     = "/rest/TsdmValName/2";
-    private const string PvnKatHref       = "/rest/TdmPvnKat/2";
+    private const string CurrencyHref = "/rest/TsdmValName/2";
+    private const string PvnKatHref = "/rest/TdmPvnKat/2";
 
     // Currency DB IDs (from MOLPORT.ADM_CODIF_ENTRY)
     private const long CurrencyIdUsd = 2;
@@ -35,6 +36,12 @@ public class HorizonService
     private readonly Dictionary<string, HorizonClient> _clients;
     private readonly OracleRepository _repo;
     private readonly ILogger<HorizonService> _logger;
+
+    // Horizon form templates rarely change once set up, and a billing code's linked customer
+    // record is effectively permanent — caching both avoids a live Horizon round trip on every
+    // single payment/customer/memorial-order creation.
+    private readonly ConcurrentDictionary<(string Account, string TemplateUrl), string> _templateCache = new();
+    private readonly ConcurrentDictionary<(string Account, string BillingCode), string> _customerCache = new();
 
     public HorizonService(IOptions<AppSettings> settings, OracleRepository repo,
         ILoggerFactory loggerFactory, ILogger<HorizonService> logger)
@@ -107,8 +114,16 @@ public class HorizonService
     private async Task<string?> GetOrCreateCustomerAsync(HorizonClient client, InvoiceBillingOrg billingOrg)
     {
         var code = billingOrg.BillingCode!.Value.ToString();
+        var cacheKey = (client.AccountName, code);
+        if (_customerCache.TryGetValue(cacheKey, out var cachedRestId))
+            return cachedRestId;
+
         var restId = await client.GetCustomerRestIdByCodeAsync(code);
-        if (restId != null) return restId;
+        if (restId != null)
+        {
+            _customerCache[cacheKey] = restId;
+            return restId;
+        }
 
         if (string.IsNullOrEmpty(billingOrg.CountryCode))
         {
@@ -127,46 +142,52 @@ public class HorizonService
             return null;
         }
 
-        var templateXml = await client.GetTemplateAsync(CustomerTemplateUrl);
+        var templateXml = await GetTemplateCachedAsync(client, CustomerTemplateUrl);
         var customerXml = BuildCustomerXml(templateXml, billingOrg, countryRestId);
         restId = await client.SaveAsync(CustomerTemplateUrl, customerXml);
         _logger.LogInformation(
             "Horizon [{Account}]: created customer {HorizonId} for billing code {Code}",
             client.AccountName, restId, code);
+        _customerCache[cacheKey] = restId;
         return restId;
+    }
+
+    // The raw template XML is re-parsed into a fresh XDocument by each caller and mutated per-order,
+    // so caching the string is safe — there's no shared mutable state between callers.
+    private async Task<string> GetTemplateCachedAsync(HorizonClient client, string templateUrl)
+    {
+        var cacheKey = (client.AccountName, templateUrl);
+        if (_templateCache.TryGetValue(cacheKey, out var cached))
+            return cached;
+
+        var xml = await client.GetTemplateAsync(templateUrl);
+        _templateCache[cacheKey] = xml;
+        return xml;
     }
 
     private async Task<string> BuildPaymentOrderXmlAsync(HorizonClient client, NormalizedTransaction tx,
         OpenInvoice invoice, string customerRestId, string receiverId)
     {
-        var templateXml = await client.GetTemplateAsync(PaymentOrderTemplateUrl);
+        var templateXml = await GetTemplateCachedAsync(client, PaymentOrderTemplateUrl);
         var doc = XDocument.Parse(templateXml);
-        var ns = doc.Descendants().First(e => e.Name.LocalName == "entity").Name.Namespace;
+        var ns = GetNamespace(doc);
 
-        XElement Find(string localName) =>
-            doc.Descendants().First(e => e.Name.LocalName == localName);
+        Find(doc, "DOK_NR").Value = tx.TransactionId;
+        Find(doc, "DAT_DOK").Value = tx.TransactionDate.ToString("yyyy-MM-dd");
 
-        Find("DOK_NR").Value = tx.TransactionId;
-        Find("DAT_DOK").Value = tx.TransactionDate.ToString("yyyy-MM-dd");
-
-        Find("PK_KLIENTS").Descendants().First(e => e.Name.LocalName == "href").Value = customerRestId;
+        Find(doc, "PK_KLIENTS").Descendants().First(e => e.Name.LocalName == "href").Value = customerRestId;
 
         // Template 10 pre-fills PK_R_ES with /rest/TDdmSaviRekAll/8 (Alliance); replace it rather than adding a second href
-        var pkREs = Find("PK_R_ES");
-        var existingHref = pkREs.Descendants().FirstOrDefault(e => e.Name.LocalName == "href");
-        if (existingHref != null)
-            existingHref.Value = receiverId;
-        else
-            pkREs.Add(new XElement(ns + "href", receiverId));
+        SetHref(Find(doc, "PK_R_ES"), ns, receiverId);
 
         var amountStr = invoice.Amount.ToString("0.##", CultureInfo.InvariantCulture);
-        Find("SUMMA").Value = amountStr;
-        Find("SUMMA_APM").Value = amountStr;
+        Find(doc, "SUMMA").Value = amountStr;
+        Find(doc, "SUMMA_APM").Value = amountStr;
 
-        Find("PK_VAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
-        Find("PK_APMVAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
+        Find(doc, "PK_VAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
+        Find(doc, "PK_APMVAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
 
-        Find("qryPamat").Add(new XElement(ns + "row",
+        Find(doc, "qryPamat").Add(new XElement(ns + "row",
             new XElement(ns + "PAMAT", invoice.InvoiceNumber),
             new XElement(ns + "SIMBSKAITS", invoice.InvoiceNumber.Length.ToString())));
 
@@ -176,34 +197,26 @@ public class HorizonService
     private async Task CreateMemorialOrderAsync(HorizonClient client, NormalizedTransaction tx)
     {
         var templateUrl = client.AccountName == "INC" ? MemorialOrderTemplateInc : MemorialOrderTemplateSia;
-        var templateXml = await client.GetTemplateAsync(templateUrl);
+        var templateXml = await GetTemplateCachedAsync(client, templateUrl);
         var doc = XDocument.Parse(templateXml);
-        var ns = doc.Descendants().First(e => e.Name.LocalName == "entity").Name.Namespace;
+        var ns = GetNamespace(doc);
 
-        XElement Find(string localName) =>
-            doc.Descendants().First(e => e.Name.LocalName == localName);
+        Find(doc, "DOK_NR").Value = tx.TransactionId;
+        Find(doc, "DAT_DOK").Value = tx.TransactionDate.ToString("yyyy-MM-dd");
+        Find(doc, "DAT_GRAM").Value = tx.TransactionDate.ToString("yyyy-MM-dd");
 
-        Find("DOK_NR").Value = tx.TransactionId;
-        Find("DAT_DOK").Value = tx.TransactionDate.ToString("yyyy-MM-dd");
-        Find("DAT_GRAM").Value = tx.TransactionDate.ToString("yyyy-MM-dd");
+        Find(doc, "SUMMA_APM").Value = tx.StripeFee!.Value.ToString("0.##", CultureInfo.InvariantCulture);
 
-        Find("SUMMA_APM").Value = tx.StripeFee!.Value.ToString("0.##", CultureInfo.InvariantCulture);
-
-        Find("PK_KLIENTS").Descendants().First(e => e.Name.LocalName == "href").Value = MemorialClientId;
-        Find("PK_VAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
-        Find("PK_APMVAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
+        Find(doc, "PK_KLIENTS").Descendants().First(e => e.Name.LocalName == "href").Value = MemorialClientId;
+        Find(doc, "PK_VAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
+        Find(doc, "PK_APMVAL").Descendants().First(e => e.Name.LocalName == "href").Value = CurrencyHref;
 
         // INC template 15 pre-fills PK_R_ES with /8; SIA template 235 leaves it empty.
         var receiverHref = client.AccountName == "INC" ? ReceiverHorizonInc : ReceiverHorizonSia;
-        var pkREs = Find("PK_R_ES");
-        var existingHref = pkREs.Descendants().FirstOrDefault(e => e.Name.LocalName == "href");
-        if (existingHref != null)
-            existingHref.Value = receiverHref;
-        else
-            pkREs.Add(new XElement(ns + "href", receiverHref));
+        SetHref(Find(doc, "PK_R_ES"), ns, receiverHref);
 
         const string reason = "Bankas komisija";
-        Find("qryPamat").Add(new XElement(ns + "row",
+        Find(doc, "qryPamat").Add(new XElement(ns + "row",
             new XElement(ns + "PAMAT", reason),
             new XElement(ns + "SIMBSKAITS", reason.Length.ToString())));
 
@@ -217,37 +230,47 @@ public class HorizonService
     private static string BuildCustomerXml(string templateXml, InvoiceBillingOrg billingOrg, string countryRestId)
     {
         var doc = XDocument.Parse(templateXml);
-        var ns = doc.Descendants().First(e => e.Name.LocalName == "entity").Name.Namespace;
+        var ns = GetNamespace(doc);
 
-        XElement? FindOrNull(string localName) =>
-            doc.Descendants().FirstOrDefault(e => e.Name.LocalName == localName);
-
-        XElement? SetHref(string parentLocalName, string value)
-        {
-            var parent = FindOrNull(parentLocalName);
-            if (parent == null) return null;
-            var existing = parent.Descendants().FirstOrDefault(e => e.Name.LocalName == "href");
-            if (existing != null)
-                existing.Value = value;
-            else
-                parent.Add(new XElement(ns + "href", value));
-            return parent;
-        }
-
-        FindOrNull("KODS")!.Value = billingOrg.BillingCode!.Value.ToString();
-        FindOrNull("NOSAUK")!.Value = billingOrg.BillingName ?? string.Empty;
+        Find(doc, "KODS").Value = billingOrg.BillingCode!.Value.ToString();
+        Find(doc, "NOSAUK").Value = billingOrg.BillingName ?? string.Empty;
 
         var vat = billingOrg.BillingVat ?? billingOrg.EinNumber ?? string.Empty;
-        var pvnRegnr = FindOrNull("PVN_REGNR");
+        var pvnRegnr = FindOrNull(doc, "PVN_REGNR");
         if (pvnRegnr != null) pvnRegnr.Value = vat;
 
-        var rezidents = FindOrNull("REZIDENTS");
+        var rezidents = FindOrNull(doc, "REZIDENTS");
         if (rezidents != null) rezidents.Value = "0";
 
-        SetHref("PK_VALSTS", countryRestId);
-        SetHref("PK_PVNK", PvnKatHref);
+        var pkValsts = FindOrNull(doc, "PK_VALSTS");
+        if (pkValsts != null) SetHref(pkValsts, ns, countryRestId);
+
+        var pkPvnk = FindOrNull(doc, "PK_PVNK");
+        if (pkPvnk != null) SetHref(pkPvnk, ns, PvnKatHref);
 
         return doc.ToString();
+    }
+
+    // Every Horizon template is walked and mutated the same way: find an element by its local name
+    // (ignoring the per-template XML namespace), and set or add its <href> child. Shared here instead
+    // of being redefined as a local function in each of the three XML-building methods above.
+    private static XNamespace GetNamespace(XDocument doc) =>
+        Find(doc, "entity").Name.Namespace;
+
+    private static XElement Find(XContainer scope, string localName) =>
+        FindOrNull(scope, localName)
+        ?? throw new InvalidOperationException($"Horizon template is missing expected element '{localName}'");
+
+    private static XElement? FindOrNull(XContainer scope, string localName) =>
+        scope.Descendants().FirstOrDefault(e => e.Name.LocalName == localName);
+
+    private static void SetHref(XElement parent, XNamespace ns, string value)
+    {
+        var existing = FindOrNull(parent, "href");
+        if (existing != null)
+            existing.Value = value;
+        else
+            parent.Add(new XElement(ns + "href", value));
     }
 
     private static string GetReceiverId(string accountName, long currencyId) =>

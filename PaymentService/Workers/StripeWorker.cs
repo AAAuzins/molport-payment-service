@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using PaymentService.Clients;
 using PaymentService.DB;
+using PaymentService.Models;
 using PaymentService.Services;
 
 namespace PaymentService.Workers;
@@ -33,34 +34,55 @@ public class StripeWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            foreach (var (accountName, client) in _clients)
+            try
             {
-                try
-                {
-                    await RunCycleAsync(accountName, client);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogError(ex, "StripeWorker cycle failed for account {Account}", accountName);
-                }
+                await RunCycleAsync();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "StripeWorker cycle failed");
             }
 
             await Task.Delay(_pollInterval, stoppingToken);
         }
     }
 
-    private async Task RunCycleAsync(string accountName, StripeApiClient client)
+    // Fetches all accounts' charges first, then runs the whole batch through PaymentMatchingService
+    // once — matching per-account would load the (shared, thousands-of-rows) open-invoice list
+    // once per account for no reason, since invoices aren't scoped by Stripe account.
+    private async Task RunCycleAsync()
     {
-        var source = $"STRIPE_{accountName.ToUpperInvariant()}";
-        var since = await _repo.GetLastSyncDateAsync(source) ?? DateTime.UtcNow.AddDays(-7);
+        var allTransactions = new List<NormalizedTransaction>();
+        var sources = new List<string>();
 
-        _logger.LogInformation("Stripe [{Account}]: fetching charges since {Since}", accountName, since);
+        foreach (var (accountName, client) in _clients)
+        {
+            var source = $"STRIPE_{accountName.ToUpperInvariant()}";
+            try
+            {
+                var since = await _repo.GetLastSyncDateAsync(source) ?? DateTime.UtcNow.AddDays(-7);
+                _logger.LogInformation("Stripe [{Account}]: fetching charges since {Since}", accountName, since);
 
-        var transactions = await client.GetSucceededChargesSinceAsync(since);
-        var allSucceeded = await _matcher.ProcessTransactionsAsync(transactions);
+                allTransactions.AddRange(await client.GetSucceededChargesSinceAsync(since));
+                sources.Add(source);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Stripe [{Account}]: fetch failed — sync state not advanced, will retry next cycle",
+                    accountName);
+            }
+        }
+
+        var allSucceeded = await _matcher.ProcessTransactionsAsync(allTransactions);
         if (allSucceeded)
-            await _repo.UpsertSyncStateAsync(source, DateTime.UtcNow);
+        {
+            var now = DateTime.UtcNow;
+            foreach (var source in sources)
+                await _repo.UpsertSyncStateAsync(source, now);
+        }
         else
-            _logger.LogWarning("Stripe [{Account}]: some transactions failed — sync state not advanced, will retry next cycle", accountName);
+        {
+            _logger.LogWarning("Stripe: some transactions failed — sync state not advanced, will retry next cycle");
+        }
     }
 }

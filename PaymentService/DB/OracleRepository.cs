@@ -205,21 +205,11 @@ public class OracleRepository
         await conn.ExecuteAsync(sql, new { transactionId });
     }
 
-    public async Task<string?> GetInvoiceNumberAsync(long invoiceId)
-    {
-        const string sql = """
-            SELECT INVOICE_NUMBER FROM ORDER_TRACKING.OT_INVOICE
-            WHERE ID = :invoiceId
-            """;
-
-        using var conn = OpenConnection();
-        return await conn.ExecuteScalarAsync<string?>(sql, new { invoiceId });
-    }
-
     public async Task<InvoiceBillingOrg?> GetInvoiceBillingOrgAsync(long invoiceId)
     {
         const string sql = """
             SELECT
+                i.INVOICE_NUMBER AS InvoiceNumber,
                 o.BILLING_CODE    AS BillingCode,
                 o.BILLING_NAME    AS BillingName,
                 o.BILLING_VAT     AS BillingVat,

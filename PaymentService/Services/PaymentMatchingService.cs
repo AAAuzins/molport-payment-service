@@ -26,6 +26,7 @@ public class PaymentMatchingService
         if (txList.Count == 0) return true;
 
         var openInvoices = (await _repo.GetOpenAdvancedPaymentInvoicesAsync()).ToList();
+        var invoiceIndex = BuildInvoiceIndex(openInvoices);
         var currencyMap = await _currencyCache.GetMapAsync();
         _logger.LogInformation("Loaded {Count} open invoices awaiting payment", openInvoices.Count);
 
@@ -34,7 +35,7 @@ public class PaymentMatchingService
         {
             try
             {
-                var result = await MatchAsync(tx, openInvoices);
+                var result = await MatchAsync(tx, invoiceIndex);
                 await RecordResultAsync(result, currencyMap);
             }
             catch (Exception ex)
@@ -48,14 +49,14 @@ public class PaymentMatchingService
         return allSucceeded;
     }
 
-    private async Task<MatchResult> MatchAsync(NormalizedTransaction tx, List<OpenInvoice> openInvoices)
+    private async Task<MatchResult> MatchAsync(NormalizedTransaction tx, InvoiceIndex invoiceIndex)
     {
         if (await _repo.PaymentExistsForTransactionAsync(tx.TransactionId))
         {
             return new MatchResult { Outcome = MatchOutcome.AlreadyProcessed, Transaction = tx };
         }
 
-        var invoice = FindInvoice(tx, openInvoices);
+        var invoice = FindInvoice(tx, invoiceIndex);
 
         if (invoice == null)
         {
@@ -98,32 +99,51 @@ public class PaymentMatchingService
         };
     }
 
-    private OpenInvoice? FindInvoice(NormalizedTransaction tx, List<OpenInvoice> invoices)
+    // Indexes the open-invoice list once per batch instead of linearly scanning it (up to 3x) per
+    // transaction — significant once the open-invoice backlog reaches the thousands.
+    // internal (not private) so PaymentService.Tests can exercise it directly without a database.
+    internal static InvoiceIndex BuildInvoiceIndex(List<OpenInvoice> invoices)
+    {
+        var byNumber = new Dictionary<string, OpenInvoice>(StringComparer.OrdinalIgnoreCase);
+        var byOrderPrefix = new Dictionary<string, OpenInvoice>(StringComparer.OrdinalIgnoreCase);
+        var byOrderNumber = new Dictionary<string, OpenInvoice>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var inv in invoices)
+        {
+            if (!string.IsNullOrEmpty(inv.InvoiceNumber))
+            {
+                byNumber.TryAdd(inv.InvoiceNumber, inv);
+
+                // e.g. "YF27O3045123-I1" indexed under the "YF27O3045123" order-number portion,
+                // so a bare-order-number reference still finds the invoice in O(1).
+                var dash = inv.InvoiceNumber.IndexOf('-');
+                if (dash > 0)
+                    byOrderPrefix.TryAdd(inv.InvoiceNumber[..dash], inv);
+            }
+
+            if (!string.IsNullOrEmpty(inv.OrderNumber))
+                byOrderNumber.TryAdd(inv.OrderNumber, inv);
+        }
+
+        return new InvoiceIndex(byNumber, byOrderPrefix, byOrderNumber);
+    }
+
+    internal static OpenInvoice? FindInvoice(NormalizedTransaction tx, InvoiceIndex index)
     {
         if (string.IsNullOrWhiteSpace(tx.ExtractedReference))
             return null;
 
         var reference = tx.ExtractedReference;
 
-        // Exact invoice number match (e.g. reference = "YF27O3045123-I1")
-        var byInvoice = invoices.FirstOrDefault(i =>
-            !string.IsNullOrEmpty(i.InvoiceNumber) &&
-            i.InvoiceNumber.Equals(reference, StringComparison.OrdinalIgnoreCase));
-        if (byInvoice != null) return byInvoice;
-
-        // Invoice starts with the order-number portion of the reference + "-" to avoid
-        // false matches with orders that share a common prefix (e.g. "YF27O3045123-" won't
-        // match "YF27O30451230-I1")
-        byInvoice = invoices.FirstOrDefault(i =>
-            !string.IsNullOrEmpty(i.InvoiceNumber) &&
-            i.InvoiceNumber.StartsWith(reference + "-", StringComparison.OrdinalIgnoreCase));
-        if (byInvoice != null) return byInvoice;
-
-        // Exact order number match
-        return invoices.FirstOrDefault(i =>
-            !string.IsNullOrEmpty(i.OrderNumber) &&
-            i.OrderNumber.Equals(reference, StringComparison.OrdinalIgnoreCase));
+        return index.ByNumber.GetValueOrDefault(reference)
+            ?? index.ByOrderPrefix.GetValueOrDefault(reference)
+            ?? index.ByOrderNumber.GetValueOrDefault(reference);
     }
+
+    internal sealed record InvoiceIndex(
+        Dictionary<string, OpenInvoice> ByNumber,
+        Dictionary<string, OpenInvoice> ByOrderPrefix,
+        Dictionary<string, OpenInvoice> ByOrderNumber);
 
     private async Task RecordResultAsync(MatchResult result, Dictionary<string, long> currencyMap)
     {

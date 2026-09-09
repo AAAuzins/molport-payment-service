@@ -8,11 +8,21 @@ using PaymentService.Services;
 
 namespace PaymentService.Workers;
 
+// Daily sweep over ORDER_TRACKING.OT_PAYMENT_REVIEW: re-attempts anything that previously failed
+// to match (NoMatch/AmountMismatch/CurrencyMismatch) or matched but couldn't reach Horizon
+// (HorizonPendingBillingOrg), in case the underlying data (missing invoice, wrong amount/reference,
+// missing billing org) has since been fixed. Transaction details are re-fetched from Stripe by charge
+// id rather than persisted locally, so amount/currency/fee/reference are always accurate and no schema
+// change to the review table is needed. Only Stripe-sourced rows are retried today.
+// Rows older than PaymentReviewRetryMaxAgeDays are no longer picked up, so a genuinely-never-fixed
+// item stops being retried instead of continuing forever — it stays visible in BO's review view for
+// manual handling.
 public class PaymentReviewRetryWorker : BackgroundService
 {
     private readonly OracleRepository _repo;
     private readonly HorizonService _horizon;
     private readonly PaymentMatchingService _matcher;
+    private readonly CurrencyCache _currencyCache;
     private readonly ILogger<PaymentReviewRetryWorker> _logger;
     private readonly Dictionary<string, StripeApiClient> _stripeClients;
     private readonly TimeSpan _interval;
@@ -22,11 +32,13 @@ public class PaymentReviewRetryWorker : BackgroundService
     private const string StripeSourcePrefix = "STRIPE_";
 
     public PaymentReviewRetryWorker(OracleRepository repo, HorizonService horizon, PaymentMatchingService matcher,
-        IOptions<AppSettings> settings, ILogger<PaymentReviewRetryWorker> logger, ILogger<StripeApiClient> stripeClientLogger)
+        CurrencyCache currencyCache, IOptions<AppSettings> settings, ILogger<PaymentReviewRetryWorker> logger,
+        ILogger<StripeApiClient> stripeClientLogger)
     {
         _repo = repo;
         _horizon = horizon;
         _matcher = matcher;
+        _currencyCache = currencyCache;
         _logger = logger;
         _interval = TimeSpan.FromHours(settings.Value.PaymentReviewRetryIntervalHours);
         _maxAgeDays = settings.Value.PaymentReviewRetryMaxAgeDays;
@@ -59,27 +71,41 @@ public class PaymentReviewRetryWorker : BackgroundService
 
         _logger.LogInformation("PaymentReviewRetryWorker: re-checking {Count} pending review item(s)", pending.Count);
 
+        // Transactions that need a full re-match are batched and run through PaymentMatchingService
+        // once at the end, instead of once per item — each call loads the entire open-invoice list
+        // (thousands of rows), so doing that per item would multiply an already-expensive query.
+        var toRematch = new List<NormalizedTransaction>();
+
         foreach (var item in pending)
         {
             try
             {
-                await RetryItemAsync(item);
+                var tx = await ResolveTransactionAsync(item);
+                if (tx == null) continue;
+
+                if (item.MatchType == HorizonPendingBillingOrg)
+                    await RetryHorizonPendingAsync(item, tx);
+                else
+                    toRematch.Add(tx);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "PaymentReviewRetryWorker: retry failed for transaction {TxId}", item.TransactionId);
             }
         }
+
+        if (toRematch.Count > 0)
+            await _matcher.ProcessTransactionsAsync(toRematch);
     }
 
-    private async Task RetryItemAsync(PendingReviewItem item)
+    private async Task<NormalizedTransaction?> ResolveTransactionAsync(PendingReviewItem item)
     {
         if (!item.Source.StartsWith(StripeSourcePrefix, StringComparison.OrdinalIgnoreCase))
         {
             _logger.LogDebug(
                 "PaymentReviewRetryWorker: skipping {TxId} — source '{Source}' is not a retryable Stripe account (legacy row or non-Stripe source)",
                 item.TransactionId, item.Source);
-            return;
+            return null;
         }
 
         var accountName = item.Source[StripeSourcePrefix.Length..];
@@ -88,18 +114,10 @@ public class PaymentReviewRetryWorker : BackgroundService
             _logger.LogWarning(
                 "PaymentReviewRetryWorker: no Stripe client configured for account '{Account}' (transaction {TxId})",
                 accountName, item.TransactionId);
-            return;
+            return null;
         }
 
-        var tx = await client.GetChargeByIdAsync(item.TransactionId);
-        if (tx == null) return; // charge no longer retrievable/valid — leave for manual review
-
-        if (item.MatchType == HorizonPendingBillingOrg)
-            await RetryHorizonPendingAsync(item, tx);
-        else
-        {
-            await _matcher.ProcessTransactionsAsync([tx]);
-        }
+        return await client.GetChargeByIdAsync(item.TransactionId); // null if no longer retrievable/valid
     }
 
     private async Task RetryHorizonPendingAsync(PendingReviewItem item, NormalizedTransaction tx)
@@ -109,15 +127,7 @@ public class PaymentReviewRetryWorker : BackgroundService
         var billingOrg = await _repo.GetInvoiceBillingOrgAsync(item.InvoiceId.Value);
         if (billingOrg?.BillingCode == null) return; // still not fixed — try again next sweep
 
-        var invoiceNumber = await _repo.GetInvoiceNumberAsync(item.InvoiceId.Value);
-        if (invoiceNumber == null)
-        {
-            _logger.LogError("PaymentReviewRetryWorker: invoice {InvoiceId} no longer exists for transaction {TxId}",
-                item.InvoiceId, item.TransactionId);
-            return;
-        }
-
-        var currencyMap = await _repo.GetCurrencyMapAsync();
+        var currencyMap = await _currencyCache.GetMapAsync();
         if (!currencyMap.TryGetValue(tx.Currency.ToUpperInvariant(), out var currencyId))
         {
             _logger.LogError("PaymentReviewRetryWorker: unknown currency '{Currency}' for transaction {TxId}",
@@ -129,7 +139,7 @@ public class PaymentReviewRetryWorker : BackgroundService
         {
             InvoiceId = item.InvoiceId.Value,
             OrderId = item.OrderId ?? 0,
-            InvoiceNumber = invoiceNumber,
+            InvoiceNumber = billingOrg.InvoiceNumber,
             Amount = tx.Amount,
             CurrencyCode = tx.Currency,
             CurrencyId = currencyId
