@@ -88,6 +88,34 @@ public class OracleRepository
         });
     }
 
+    public async Task UpdateInvoiceBalanceAsync(long invoiceId)
+    {
+        const string sql = """
+            UPDATE ORDER_TRACKING.OT_INVOICE i
+            SET i.PAID_AMOUNT = (
+                    SELECT NVL(SUM(p.PAYMENT_AMOUNT), 0)
+                    FROM ORDER_TRACKING.OT_PAYMENT p
+                    WHERE p.INVOICE_ID = :invoiceId
+                ),
+                i.BALANCE_DUE =
+                    NVL(i.PRICE, 0) - NVL(i.PRICE_DISCOUNT, 0)
+                    + NVL(i.QC_PRICE, 0) + NVL(i.REFORMATTING_PRICE, 0) + NVL(i.REWEIGHING_PRICE, 0)
+                    + NVL(i.DRY_ICE_PRICE, 0) + NVL(i.HANDLING_COST_PRICE, 0)
+                    + NVL(i.VAT21_PRICE, 0) + NVL(i.REIMBURSEMENT_PRICE, 0) + NVL(i.SALES_TAX_PRICE, 0)
+                    + NVL(i.SHIPPING_PRICE, 0) + NVL(i.TARIFF_AMOUNT, 0)
+                    - (
+                        SELECT NVL(SUM(p.PAYMENT_AMOUNT), 0)
+                        FROM ORDER_TRACKING.OT_PAYMENT p
+                        WHERE p.INVOICE_ID = :invoiceId
+                    ),
+                i.MODIFIED = SYSDATE
+            WHERE i.ID = :invoiceId
+            """;
+
+        using var conn = OpenConnection();
+        await conn.ExecuteAsync(sql, new { invoiceId });
+    }
+
     public async Task<Dictionary<string, long>> GetCurrencyMapAsync()
     {
         const string sql = """

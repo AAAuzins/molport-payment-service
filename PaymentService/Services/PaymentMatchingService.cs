@@ -136,6 +136,7 @@ public class PaymentMatchingService
                 await _repo.InsertPaymentAsync(
                     inv.InvoiceId, inv.OrderId, tx.Amount, inv.CurrencyId,
                     tx.TransactionDate, tx.TransactionId, tx.Source == PaymentSource.Stripe);
+                await _repo.UpdateInvoiceBalanceAsync(inv.InvoiceId);
                 _logger.LogInformation(
                     "[{Source}] Matched transaction {TxId} → Invoice {InvoiceNr} ({Amount} {Currency})",
                     tx.Source, tx.TransactionId, inv.InvoiceNumber, tx.Amount, tx.Currency);
